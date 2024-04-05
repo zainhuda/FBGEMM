@@ -92,7 +92,9 @@ class BackwardSplitGenerator:
             )
 
         # Generate optimizer kernel
-        CodeTemplate.load("embedding_optimizer_split_device_kernel_template.cuh").write(
+        CodeTemplate.load(
+            "training/optimizer/embedding_optimizer_split_device_kernel_template.cuh"
+        ).write(
             f"gen_embedding_optimizer_{optimizer}_split_device_kernel.cuh", **kwargs
         )
 
@@ -107,11 +109,11 @@ class BackwardSplitGenerator:
                     f"gen_embedding_backward_split_{optimizer}.cpp",
                 ),
                 (
-                    "embedding_split_host_pt2_autograd_template.cpp",
+                    "training/pt2/embedding_split_host_pt2_autograd_template.cpp",
                     f"gen_embedding_split_{optimizer}_pt2_autograd.cpp",
                 ),
                 (
-                    "embedding_split_host_pt2_cuda_wrapper_template.cpp",
+                    "training/pt2/embedding_split_host_pt2_cuda_wrapper_template.cpp",
                     f"gen_embedding_backward_split_{optimizer}_pt2_cuda_wrapper.cpp",
                 ),
             ]:
@@ -122,7 +124,7 @@ class BackwardSplitGenerator:
             if kwargs.get("has_cpu_support") or kwargs.get("has_gpu_support"):
                 # Generates Python invoker for CUDA + CPU, and PT2
                 template = CodeTemplate.load(
-                    "split_embedding_codegen_lookup_invoker.template"
+                    "training/python/split_embedding_codegen_lookup_invoker.template"
                 )
                 for filename in [
                     f"lookup_{optimizer}.py",
@@ -154,7 +156,7 @@ class BackwardSplitGenerator:
                     f"gen_embedding_backward_split_{optimizer}_cpu.cpp",
                 ),
                 (
-                    "embedding_split_host_pt2_cpu_wrapper_template.cpp",
+                    "training/pt2/embedding_split_host_pt2_cpu_wrapper_template.cpp",
                     f"gen_embedding_backward_split_{optimizer}_pt2_cpu_wrapper.cpp",
                 ),
             ]:
@@ -217,7 +219,7 @@ class BackwardSplitGenerator:
 
     @staticmethod
     def generate_init_py() -> None:
-        CodeTemplate.load("__init__.template").write("__init__.py")
+        CodeTemplate.load("training/python/__init__.template").write("__init__.py")
 
     @staticmethod
     def generate() -> None:
