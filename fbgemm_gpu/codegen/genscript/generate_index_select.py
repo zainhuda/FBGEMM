@@ -29,31 +29,31 @@ class IndexSelectGenerator:
         optargs = OptimizerArgsSet.create([(FLOAT, "unused")])
         for template_file, generated_file in [
             (
-                "embedding_forward_split_template.cu",
+                "training/forward/embedding_forward_split_template.cu",
                 "gen_batch_index_select_dim0_forward_codegen_cuda.cu",
             ),
             (
-                "embedding_forward_split_kernel_template.cu",
+                "training/forward/embedding_forward_split_kernel_template.cu",
                 "gen_batch_index_select_dim0_forward_kernel.cu",
             ),
             (
-                "embedding_forward_split_kernel_nobag_small_template.cu",
+                "training/forward/embedding_forward_split_kernel_nobag_small_template.cu",
                 "gen_batch_index_select_dim0_forward_kernel_small.cu",
             ),
             (
-                "embedding_backward_split_template.cu",
+                "training/backward/embedding_backward_split_template.cu",
                 "gen_batch_index_select_dim0_backward_codegen_cuda.cu",
             ),
             (
-                "embedding_backward_split_kernel_cta_template.cu",
+                "training/backward/embedding_backward_split_kernel_cta_template.cu",
                 "gen_batch_index_select_dim0_backward_kernel_cta.cu",
             ),
             (
-                "embedding_backward_split_kernel_warp_template.cu",
+                "training/backward/embedding_backward_split_kernel_warp_template.cu",
                 "gen_batch_index_select_dim0_backward_kernel_warp.cu",
             ),
             (
-                "embedding_backward_split_device_kernel_template.cuh",
+                "training/backward/embedding_backward_split_device_kernel_template.cuh",
                 "gen_embedding_backward_batch_index_select_split_device_kernel.cuh",
             ),
         ]:
@@ -69,13 +69,17 @@ class IndexSelectGenerator:
                 args=optargs.cuda,
             )
 
-        CodeTemplate.load("embedding_backward_split_grad_template.cu").write(
+        CodeTemplate.load(
+            "training/backward/embedding_backward_split_grad_template.cu"
+        ).write(
             "gen_embedding_backward_split_grad_index_select.cu",
             is_index_select=True,
         )
 
         # Generate common backward device kernels (generate only once)
-        CodeTemplate.load("embedding_backward_split_device_kernel_template.cuh").write(
+        CodeTemplate.load(
+            "training/backward/embedding_backward_split_device_kernel_template.cuh"
+        ).write(
             "gen_embedding_backward_common_split_device_kernel.cuh",
             gen_once=True,
         )
