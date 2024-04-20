@@ -11,15 +11,19 @@
 
 
 import argparse
+import itertools
 import os
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import jinja2
 
-# pyre-ignore[5]
-TENSOR, INT_TENSOR, LONG_TENSOR, INT, FLOAT = range(5)
+try:
+    from .torch_type_utils import arg_type_to_tensor_type, ArgType, TensorType
+except ImportError:
+    # pyre-ignore[21]
+    from torch_type_utils import arg_type_to_tensor_type, ArgType, TensorType
 
 
 ######################################################################
@@ -52,6 +56,10 @@ def _arg(
     )
 
 
+def demangle_name(name: str) -> str:
+    return name.replace("_dev", "").replace("_uvm", "")
+
+
 def acc_cache_tensor_arg_constructor(name: str, gpu: bool = True) -> str:
     return _arg_constructor(
         "at::acc_type<" + ("cache_t" if gpu else "scalar_t") + ", true>",
@@ -61,9 +69,30 @@ def acc_cache_tensor_arg_constructor(name: str, gpu: bool = True) -> str:
     )
 
 
+def acc_placeholder_tensor_arg_constructor(name: str, gpu: bool = True) -> str:
+    return _arg_constructor(
+        demangle_name(name) + "_ph_t",
+        name,
+        gpu=gpu,
+        precision=64,
+    )
+
+
 def acc_cache_tensor_arg(name: str, gpu: bool = True, pass_by_ref: bool = False) -> str:
     return _arg(
         "at::acc_type<" + ("cache_t" if gpu else "scalar_t") + ", true>",
+        name,
+        gpu=gpu,
+        precision=64,
+        pass_by_ref=pass_by_ref,
+    )
+
+
+def acc_placeholder_tensor_arg(
+    name: str, gpu: bool = True, pass_by_ref: bool = False
+) -> str:
+    return _arg(
+        demangle_name(name) + "_ph_t",
         name,
         gpu=gpu,
         precision=64,
@@ -120,18 +149,21 @@ def int_arg(name: str, default: int = 0) -> str:
 
 
 def make_kernel_arg(
-    ty: int, name: str, default: Union[int, float, None], pass_by_ref: bool = False
+    ty: ArgType, name: str, default: Union[int, float, None], pass_by_ref: bool = False
 ) -> str:
     return {
-        TENSOR: lambda x: acc_cache_tensor_arg(x, pass_by_ref=pass_by_ref),
-        INT_TENSOR: lambda x: int_tensor_arg(x, pass_by_ref=pass_by_ref),
-        LONG_TENSOR: lambda x: long_tensor_arg(x, pass_by_ref=pass_by_ref),
-        INT: (
+        ArgType.TENSOR: lambda x: acc_cache_tensor_arg(x, pass_by_ref=pass_by_ref),
+        ArgType.INT_TENSOR: lambda x: int_tensor_arg(x, pass_by_ref=pass_by_ref),
+        ArgType.LONG_TENSOR: lambda x: long_tensor_arg(x, pass_by_ref=pass_by_ref),
+        ArgType.PLACEHOLDER_TENSOR: lambda x: acc_placeholder_tensor_arg(
+            x, pass_by_ref=pass_by_ref
+        ),
+        ArgType.INT: (
             (lambda x: int64_arg(x, default=int(default)))
             if default is not None
             else int64_arg_no_default
         ),
-        FLOAT: (
+        ArgType.FLOAT: (
             (lambda x: float_arg(x, default=default))
             if default is not None
             else float_arg_no_default
@@ -139,47 +171,55 @@ def make_kernel_arg(
     }[ty](name)
 
 
-def make_kernel_arg_constructor(ty: int, name: str) -> str:
+def make_kernel_arg_constructor(ty: ArgType, name: str) -> str:
     return {
-        TENSOR: acc_cache_tensor_arg_constructor,
-        INT_TENSOR: int_tensor_arg_constructor,
-        LONG_TENSOR: long_tensor_arg_constructor,
-        INT: lambda x: x,
-        FLOAT: lambda x: x,
+        ArgType.TENSOR: acc_cache_tensor_arg_constructor,
+        ArgType.INT_TENSOR: int_tensor_arg_constructor,
+        ArgType.LONG_TENSOR: long_tensor_arg_constructor,
+        ArgType.PLACEHOLDER_TENSOR: acc_placeholder_tensor_arg_constructor,
+        ArgType.INT: lambda x: x,
+        ArgType.FLOAT: lambda x: x,
     }[ty](name)
 
 
-def make_cpu_kernel_arg(ty: int, name: str, default: Union[int, float]) -> str:
+def make_cpu_kernel_arg(ty: ArgType, name: str, default: Union[int, float]) -> str:
     return {
-        TENSOR: lambda x: acc_cache_tensor_arg(x, gpu=False),
-        INT_TENSOR: lambda x: int_tensor_arg(x, gpu=False),
-        LONG_TENSOR: lambda x: long_tensor_arg(x, gpu=False),
-        INT: lambda x: int64_arg(x, default=int(default)),
-        FLOAT: lambda x: float_arg(x, default=default),
+        ArgType.TENSOR: lambda x: acc_cache_tensor_arg(x, gpu=False),
+        ArgType.INT_TENSOR: lambda x: int_tensor_arg(x, gpu=False),
+        ArgType.LONG_TENSOR: lambda x: long_tensor_arg(x, gpu=False),
+        ArgType.PLACEHOLDER_TENSOR: acc_cache_tensor_arg_constructor,
+        ArgType.INT: lambda x: int64_arg(x, default=int(default)),
+        ArgType.FLOAT: lambda x: float_arg(x, default=default),
     }[ty](name)
 
 
-def make_cpu_kernel_arg_constructor(ty: int, name: str) -> str:
+def make_cpu_kernel_arg_constructor(ty: ArgType, name: str) -> str:
     return {
-        TENSOR: lambda x: acc_cache_tensor_arg_constructor(x, gpu=False),
-        INT_TENSOR: lambda x: int_tensor_arg_constructor(x, gpu=False),
-        LONG_TENSOR: lambda x: long_tensor_arg_constructor(x, gpu=False),
-        INT: lambda x: x,
-        FLOAT: lambda x: x,
+        ArgType.TENSOR: lambda x: acc_cache_tensor_arg_constructor(x, gpu=False),
+        ArgType.INT_TENSOR: lambda x: int_tensor_arg_constructor(x, gpu=False),
+        ArgType.LONG_TENSOR: lambda x: long_tensor_arg_constructor(x, gpu=False),
+        ArgType.PLACEHOLDER_TENSOR: lambda x: acc_cache_tensor_arg_constructor(
+            x, gpu=False
+        ),
+        ArgType.INT: lambda x: x,
+        ArgType.FLOAT: lambda x: x,
     }[ty](name)
 
 
-def make_function_arg(ty: int, name: str, default: Optional[Union[int, float]]) -> str:
+def make_function_arg(
+    ty: ArgType, name: str, default: Optional[Union[int, float]]
+) -> str:
     return {
-        TENSOR: tensor_arg,
-        INT_TENSOR: tensor_arg,
-        LONG_TENSOR: tensor_arg,
-        INT: (
+        ArgType.TENSOR: tensor_arg,
+        ArgType.INT_TENSOR: tensor_arg,
+        ArgType.LONG_TENSOR: tensor_arg,
+        ArgType.PLACEHOLDER_TENSOR: tensor_arg,
+        ArgType.INT: (
             (lambda x: int64_arg(x, default=int(default)))
             if default is not None
             else int64_arg_no_default
         ),
-        FLOAT: (
+        ArgType.FLOAT: (
             (lambda x: double_arg(x, default=default))
             if default is not None
             else double_arg_no_default
@@ -187,18 +227,36 @@ def make_function_arg(ty: int, name: str, default: Optional[Union[int, float]]) 
     }[ty](name)
 
 
-def make_function_schema_arg(ty: int, name: str, default: Union[int, float]) -> str:
+def make_function_schema_arg(ty: ArgType, name: str, default: Union[int, float]) -> str:
     return {
-        TENSOR: tensor_arg,
-        INT_TENSOR: tensor_arg,
-        LONG_TENSOR: tensor_arg,
-        INT: lambda x: int_arg(x, default=int(default)),
-        FLOAT: lambda x: float_arg(x, default=default),
+        ArgType.TENSOR: tensor_arg,
+        ArgType.INT_TENSOR: tensor_arg,
+        ArgType.LONG_TENSOR: tensor_arg,
+        ArgType.PLACEHOLDER_TENSOR: tensor_arg,
+        ArgType.INT: lambda x: int_arg(x, default=int(default)),
+        ArgType.FLOAT: lambda x: float_arg(x, default=default),
     }[ty](name)
 
 
-def make_ivalue_cast(ty: int) -> str:
-    return {INT: "toInt", FLOAT: "toDouble"}[ty]
+def make_ivalue_cast(ty: ArgType) -> str:
+    return {ArgType.INT: "toInt", ArgType.FLOAT: "toDouble"}[ty]
+
+
+######################################################################
+# Optimizer Args Set Item
+######################################################################
+
+
+@dataclass
+class OptimizerArgsSetItem:
+    ty: ArgType  # type
+    name: str
+    default: Union[float, ArgType] = 0  # DEFAULT_ARG_VAL
+    ph_tys: Optional[List[ArgType]] = None  # placeholder types
+
+
+# Alias b/c the name is too long
+OptimItem = OptimizerArgsSetItem
 
 
 ######################################################################
@@ -217,69 +275,108 @@ class OptimizerArgs:
     split_function_args_no_defaults: List[str]
     split_saved_tensors: List[str]
     split_tensors: List[str]
+    split_tensor_types: Dict[str, str]
     saved_data: List[Tuple[str, str]]
     split_function_arg_names: List[str]
     split_function_schemas: List[str]
     split_variables: List[str]
     split_ref_kernel_args: List[str]
+    placeholder_tensor_names: List[str]
+    placeholder_type_combos: Union[List[Dict[str, TensorType]], List[None]]
 
     @staticmethod
     # pyre-ignore[3]
     def create(
-        split_arg_spec: List[Tuple[int, str, Union[int, float]]],
-        augmented_arg_spec: List[Tuple[int, str, Union[int, float]]],
+        split_arg_spec: List[OptimItem],
+        arg_spec: List[OptimItem],
     ):
+        # Compute placeholder tensor combinations
+        ph_tensor_names = [
+            s.name for s in arg_spec if s.ty == ArgType.PLACEHOLDER_TENSOR
+        ]
+        ph_tensor_types = [
+            # pyre-ignore[16]
+            [arg_type_to_tensor_type[t] for t in s.ph_tys]
+            for s in arg_spec
+            if s.ty == ArgType.PLACEHOLDER_TENSOR
+        ]
+        if len(ph_tensor_names) > 0:
+            ph_combos_list = itertools.product(*ph_tensor_types)
+            ph_combos = [
+                {k: ph for k, ph in zip(ph_tensor_names, combo)}
+                for combo in ph_combos_list
+            ]
+        else:
+            ph_combos = [None]
+
         return OptimizerArgs(
+            # GPU kernel args
             split_kernel_args=[
-                make_kernel_arg(ty, name, default)
-                for (ty, name, default) in split_arg_spec
+                make_kernel_arg(s.ty, s.name, s.default) for s in split_arg_spec
             ],
             split_kernel_args_no_defaults=[
-                make_kernel_arg(ty, name, None) for (ty, name, _) in split_arg_spec
+                make_kernel_arg(s.ty, s.name, None) for s in split_arg_spec
             ],
             split_kernel_arg_constructors=[
-                make_kernel_arg_constructor(ty, name)
-                for (ty, name, default) in split_arg_spec
+                make_kernel_arg_constructor(s.ty, s.name) for s in split_arg_spec
             ],
+            # CPU kernel args
             split_cpu_kernel_args=[
-                make_cpu_kernel_arg(ty, name, default)
-                for (ty, name, default) in split_arg_spec
+                make_cpu_kernel_arg(s.ty, s.name, s.default) for s in split_arg_spec
             ],
             split_cpu_kernel_arg_constructors=[
-                make_cpu_kernel_arg_constructor(ty, name)
-                for (ty, name, default) in split_arg_spec
+                make_cpu_kernel_arg_constructor(s.ty, s.name) for s in split_arg_spec
             ],
+            # Function args
             split_function_args=[
-                make_function_arg(ty, name, default)
-                for (ty, name, default) in split_arg_spec
+                make_function_arg(s.ty, s.name, s.default) for s in split_arg_spec
             ],
             split_function_args_no_defaults=[
-                make_function_arg(ty, name, None)
-                for (ty, name, default) in split_arg_spec
+                make_function_arg(s.ty, s.name, None) for s in split_arg_spec
             ],
+            # Helper values
             split_tensors=[
-                name for (ty, name, default) in augmented_arg_spec if ty == TENSOR
+                s.name
+                for s in arg_spec
+                if s.ty in (ArgType.TENSOR, ArgType.PLACEHOLDER_TENSOR)
             ],
+            split_tensor_types={
+                s.name: (
+                    "at::acc_type<cache_t, true>"
+                    if s.ty == ArgType.TENSOR
+                    else (s.name + "_ph_t")
+                )
+                for s in arg_spec
+                if s.ty in (ArgType.TENSOR, ArgType.PLACEHOLDER_TENSOR)
+            },
             split_saved_tensors=[
-                name
-                for (ty, name, default) in split_arg_spec
-                if ty in (TENSOR, INT_TENSOR, LONG_TENSOR)
+                s.name
+                for s in split_arg_spec
+                if s.ty
+                in (
+                    ArgType.TENSOR,
+                    ArgType.INT_TENSOR,
+                    ArgType.LONG_TENSOR,
+                    ArgType.PLACEHOLDER_TENSOR,
+                )
             ],
             saved_data=[
-                (name, make_ivalue_cast(ty))
-                for (ty, name, default) in augmented_arg_spec
-                if ty != TENSOR
+                (s.name, make_ivalue_cast(s.ty))
+                for s in arg_spec
+                if s.ty not in (ArgType.TENSOR, ArgType.PLACEHOLDER_TENSOR)
             ],
-            split_function_arg_names=[name for (ty, name, default) in split_arg_spec],
+            split_function_arg_names=[s.name for s in split_arg_spec],
             split_function_schemas=[
-                make_function_schema_arg(ty, name, default)
-                for (ty, name, default) in split_arg_spec
+                make_function_schema_arg(s.ty, s.name, s.default)
+                for s in split_arg_spec
             ],
             split_variables=["Variable()" for _ in split_arg_spec],
             split_ref_kernel_args=[
-                make_kernel_arg(ty, name, default, pass_by_ref=True)
-                for (ty, name, default) in split_arg_spec
+                make_kernel_arg(s.ty, s.name, s.default, pass_by_ref=True)
+                for s in split_arg_spec
             ],
+            placeholder_tensor_names=ph_tensor_names,
+            placeholder_type_combos=ph_combos,
         )
 
 
@@ -295,78 +392,66 @@ class OptimizerArgsSet:
     any: OptimizerArgs
 
     @staticmethod
-    def create_for_cpu(
-        augmented_arg_spec: List[Tuple[int, str, Union[float, int]]]
+    def create_optim_args(
+        arg_spec: List[OptimItem], ext_fn: Callable[[OptimItem], List[OptimItem]]
     ) -> OptimizerArgs:
         split_arg_spec = []
-        for ty, arg, default in augmented_arg_spec:
-            if ty in (FLOAT, INT):
-                split_arg_spec.append((ty, arg, default))
+        for s in arg_spec:
+            if s.ty in (ArgType.FLOAT, ArgType.INT):
+                split_arg_spec.append(OptimItem(s.ty, s.name, s.default))
             else:
-                assert ty == TENSOR
-                split_arg_spec.extend(
-                    [
-                        (TENSOR, f"{arg}_host", default),
-                        (INT_TENSOR, f"{arg}_placements", default),
-                        (LONG_TENSOR, f"{arg}_offsets", default),
-                    ]
-                )
-        return OptimizerArgs.create(split_arg_spec, augmented_arg_spec)
+                assert s.ty in (ArgType.TENSOR, ArgType.PLACEHOLDER_TENSOR)
+                # Treat PLACEHOLDER_TENSOR as TENSOR for CPU
+                split_arg_spec.extend(ext_fn(s))
+        return OptimizerArgs.create(split_arg_spec, arg_spec)
 
     @staticmethod
-    def create_for_cuda(
-        augmented_arg_spec: List[Tuple[int, str, Union[float, int]]]
-    ) -> OptimizerArgs:
-        split_arg_spec = []
-        for ty, arg, default in augmented_arg_spec:
-            if ty in (FLOAT, INT):
-                split_arg_spec.append((ty, arg, default))
-            else:
-                assert ty == TENSOR
-                split_arg_spec.extend(
-                    [
-                        (TENSOR, f"{arg}_dev", default),
-                        (TENSOR, f"{arg}_uvm", default),
-                        (INT_TENSOR, f"{arg}_placements", default),
-                        (LONG_TENSOR, f"{arg}_offsets", default),
-                    ]
-                )
-        return OptimizerArgs.create(split_arg_spec, augmented_arg_spec)
+    def extend_for_cpu(spec: OptimItem) -> List[OptimItem]:
+        name = spec.name
+        default = spec.default
+        return [
+            OptimItem(ArgType.TENSOR, f"{name}_host", default),
+            OptimItem(ArgType.INT_TENSOR, f"{name}_placements", default),
+            OptimItem(ArgType.LONG_TENSOR, f"{name}_offsets", default),
+        ]
 
     @staticmethod
-    def create_for_any(
-        augmented_arg_spec: List[Tuple[int, str, Union[float, int]]]
-    ) -> OptimizerArgs:
-        split_arg_spec = []
-        for ty, arg, default in augmented_arg_spec:
-            if ty in (FLOAT, INT):
-                split_arg_spec.append((ty, arg, default))
-            else:
-                assert ty == TENSOR
-                split_arg_spec.extend(
-                    [
-                        (TENSOR, f"{arg}_host", default),
-                        (TENSOR, f"{arg}_dev", default),
-                        (TENSOR, f"{arg}_uvm", default),
-                        (INT_TENSOR, f"{arg}_placements", default),
-                        (LONG_TENSOR, f"{arg}_offsets", default),
-                    ]
-                )
-        return OptimizerArgs.create(split_arg_spec, augmented_arg_spec)
+    def extend_for_cuda(spec: OptimItem) -> List[OptimItem]:
+        name = spec.name
+        default = spec.default
+        ty = spec.ty
+        ph_tys = spec.ph_tys
+        return [
+            OptimItem(ty, f"{name}_dev", default, ph_tys),
+            OptimItem(ty, f"{name}_uvm", default, ph_tys),
+            OptimItem(ArgType.INT_TENSOR, f"{name}_placements", default),
+            OptimItem(ArgType.LONG_TENSOR, f"{name}_offsets", default),
+        ]
+
+    @staticmethod
+    def extend_for_any(spec: OptimItem) -> List[OptimItem]:
+        name = spec.name
+        default = spec.default
+        ty = spec.ty
+        ph_tys = spec.ph_tys
+        return [
+            OptimItem(ArgType.TENSOR, f"{name}_host", default),
+            OptimItem(ty, f"{name}_dev", default, ph_tys),
+            OptimItem(ty, f"{name}_uvm", default, ph_tys),
+            OptimItem(ArgType.INT_TENSOR, f"{name}_placements", default),
+            OptimItem(ArgType.LONG_TENSOR, f"{name}_offsets", default),
+        ]
 
     @staticmethod
     # pyre-ignore[3]
-    def create(
-        arg_spec: List[Union[Tuple[int, str], Tuple[int, str, Union[float, int]]]]
-    ):
-        DEFAULT_ARG_VAL = 0
-        # pyre-ignore[9]
-        augmented_arg_spec: List[Tuple[int, str, Union[float, int]]] = [
-            item if len(item) == 3 else (*item, DEFAULT_ARG_VAL) for item in arg_spec
-        ]
-
+    def create(arg_spec: List[OptimItem]):
         return OptimizerArgsSet(
-            OptimizerArgsSet.create_for_cpu(augmented_arg_spec),
-            OptimizerArgsSet.create_for_cuda(augmented_arg_spec),
-            OptimizerArgsSet.create_for_any(augmented_arg_spec),
+            *(
+                OptimizerArgsSet.create_optim_args(arg_spec, ext_fn)
+                for ext_fn in (
+                    OptimizerArgsSet.extend_for_cpu,
+                    OptimizerArgsSet.extend_for_cuda,
+                    OptimizerArgsSet.extend_for_any,
+                )
+            )
         )
