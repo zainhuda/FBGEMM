@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <functional>
 
 #include <ATen/ATen.h>
@@ -269,10 +270,11 @@ void _permute_2D_lengths_cpu_kernel(
 template <
     bool sequence,
     bool has_weight,
+    bool return_bucket_mapping,
     typename offset_t,
     typename index_t,
     typename scalar_t>
-void _block_bucketize_sparse_features_cpu(
+void _block_bucketize_sparse_features_cpu_kernel(
     const Tensor& lengths,
     const Tensor& indices,
     const c10::optional<Tensor>& weights,
@@ -285,7 +287,8 @@ void _block_bucketize_sparse_features_cpu(
     c10::optional<Tensor> new_pos,
     const c10::optional<Tensor>& unbucketize_permute,
     const c10::optional<Tensor>& batch_size_per_feature,
-    const c10::optional<std::vector<at::Tensor>>& block_bucketize_pos) {
+    const c10::optional<std::vector<at::Tensor>>& block_bucketize_pos,
+    const c10::optional<Tensor>& bucket_mapping) {
   // allocate tensors and buffers
   const auto lengths_size = lengths.numel();
   const auto new_lengths_size = lengths_size * my_size;
@@ -300,6 +303,7 @@ void _block_bucketize_sparse_features_cpu(
   scalar_t* new_weights_data = nullptr;
   index_t* new_pos_data = nullptr;
   index_t* unbucketize_permute_data = nullptr;
+  index_t* bag_mapping_data = nullptr;
   offset_t* const new_lengths_data = new_lengths.data_ptr<offset_t>();
   offset_t* const new_offsets_data = new_offsets.data_ptr<offset_t>();
   index_t* const new_indices_data = new_indices.data_ptr<index_t>();
@@ -314,6 +318,9 @@ void _block_bucketize_sparse_features_cpu(
 
   if constexpr (sequence) {
     unbucketize_permute_data = unbucketize_permute.value().data_ptr<index_t>();
+    if constexpr (return_bucket_mapping) {
+      bag_mapping_data = bucket_mapping.value().data_ptr<index_t>();
+    }
   }
   if constexpr (has_weight) {
     weights_data = weights.value().data_ptr<scalar_t>();
@@ -412,6 +419,9 @@ void _block_bucketize_sparse_features_cpu(
         new_indices_data[pos] = new_idx;
         if (sequence) {
           unbucketize_permute_data[i] = pos;
+          if constexpr (return_bucket_mapping) {
+            bag_mapping_data[i] = p;
+          }
         }
         new_offsets_data[p * lengths_size + b_t]++;
         if (has_weight) {
@@ -926,6 +936,206 @@ Tensor invert_permute_cpu(const Tensor& permute) {
 
   return inversed_permute;
 }
+template <typename index_t, typename offset_t>
+void _populate_bucketized_permute_cpu(
+    const offset_t* const length_data,
+    const offset_t* const offset_data,
+    offset_t* const bucketized_offsets_data,
+    const index_t* const bucket_mapping_data,
+    index_t* const bucketized_permute_data_out,
+    int64_t length_size) {
+  for (const auto i : c10::irange(length_size)) {
+    const auto length = length_data[i];
+    const auto offset = offset_data[i];
+    for (const auto j : c10::irange(length)) {
+      const auto index = offset + j;
+      const auto bucket = bucket_mapping_data[index];
+      bucketized_permute_data_out[index] =
+          bucketized_offsets_data[bucket * length_size + i]++;
+    }
+  }
+}
+
+Tensor populate_bucketized_permute_cpu(
+    const Tensor& lengths,
+    const Tensor& bucketized_lengths,
+    const Tensor& bucket_mapping) {
+  const auto lengths_contig = lengths.expect_contiguous();
+  const auto bucketized_lengths_contig = bucketized_lengths.expect_contiguous();
+  const auto bucket_mapping_contig = bucket_mapping.expect_contiguous();
+  Tensor bucketized_permute = native_empty_like(*bucket_mapping_contig);
+  const auto offsets = asynchronous_complete_cumsum_cpu(*lengths_contig);
+  const auto bucketized_offsets =
+      asynchronous_complete_cumsum_cpu(*bucketized_lengths_contig);
+  AT_DISPATCH_INDEX_TYPES(
+      lengths.scalar_type(), "populate_bucketized_permute_cpu_1", ([&] {
+        using offset_t = index_t;
+        AT_DISPATCH_INDEX_TYPES(
+            bucket_mapping_contig->scalar_type(),
+            "populate_bucketized_permute_cpu_2",
+            ([&] {
+              _populate_bucketized_permute_cpu<index_t, offset_t>(
+                  lengths_contig->data_ptr<offset_t>(),
+                  offsets.data_ptr<offset_t>(),
+                  bucketized_offsets.data_ptr<offset_t>(),
+                  bucket_mapping_contig->data_ptr<index_t>(),
+                  bucketized_permute.data_ptr<index_t>(),
+                  lengths_contig->numel());
+            }));
+      }));
+  return bucketized_permute;
+}
+
+std::tuple<
+    Tensor,
+    Tensor,
+    c10::optional<Tensor>,
+    c10::optional<Tensor>,
+    c10::optional<Tensor>,
+    c10::optional<Tensor>>
+_block_bucketize_sparse_features_cpu(
+    const Tensor& lengths,
+    const Tensor& indices,
+    const bool bucketize_pos,
+    const bool sequence,
+    const Tensor& block_sizes,
+    const int64_t my_size,
+    const c10::optional<Tensor>& weights,
+    const c10::optional<Tensor>& batch_size_per_feature,
+    const int64_t /* max_batch_size */, // Only used in GPU variant
+    const c10::optional<std::vector<at::Tensor>>& block_bucketize_pos,
+    const bool return_bucket_mapping) {
+  const auto lengths_size = lengths.numel();
+  const auto new_lengths_size = lengths_size * my_size;
+  auto new_lengths = at::zeros({new_lengths_size}, lengths.options());
+  auto new_indices = native_empty_like(indices);
+  Tensor new_weights;
+  Tensor new_pos;
+  Tensor unbucketize_permute;
+  Tensor bucket_mapping;
+  if (bucketize_pos) {
+    new_pos = native_empty_like(indices);
+  }
+#define LAUNCH_BLOCK_BUCKETIZE_SPARSE_FEATURES_WITH_WEIGHT(      \
+    sequence, return_bucket_mapping)                             \
+  AT_DISPATCH_INDEX_TYPES(                                       \
+      lengths.scalar_type(),                                     \
+      "block_bucketize_sparse_features_weights_cpu_1",           \
+      [&] {                                                      \
+        using offset_t = index_t;                                \
+        AT_DISPATCH_INDEX_TYPES(                                 \
+            indices.scalar_type(),                               \
+            "block_bucketize_sparse_features_weights_cpu_2",     \
+            [&] {                                                \
+              FBGEMM_DISPATCH_FLOAT_ONLY(                        \
+                  weights_value.scalar_type(),                   \
+                  "bucketize_sparse_features_weights_cpu_3",     \
+                  [&] {                                          \
+                    _block_bucketize_sparse_features_cpu_kernel< \
+                        sequence,                                \
+                        true,                                    \
+                        return_bucket_mapping,                   \
+                        offset_t,                                \
+                        index_t,                                 \
+                        scalar_t>(                               \
+                        lengths,                                 \
+                        indices,                                 \
+                        weights,                                 \
+                        bucketize_pos,                           \
+                        block_sizes,                             \
+                        my_size,                                 \
+                        new_lengths,                             \
+                        new_indices,                             \
+                        new_weights,                             \
+                        new_pos,                                 \
+                        unbucketize_permute,                     \
+                        batch_size_per_feature,                  \
+                        block_bucketize_pos,                     \
+                        bucket_mapping);                         \
+                  });                                            \
+            });                                                  \
+      });
+
+#define LAUNCH_BLOCK_BUCKETIZE_SPARSE_FEATURES_WITHOUT_WEIGHT(              \
+    sequence, return_bucket_mapping)                                        \
+  AT_DISPATCH_INDEX_TYPES(                                                  \
+      lengths.scalar_type(), "block_bucketize_sparse_features_cpu_1", [&] { \
+        using offset_t = index_t;                                           \
+        AT_DISPATCH_INDEX_TYPES(                                            \
+            indices.scalar_type(),                                          \
+            "block_bucketize_sparse_features_cpu_2",                        \
+            [&] {                                                           \
+              _block_bucketize_sparse_features_cpu_kernel<                  \
+                  sequence,                                                 \
+                  false,                                                    \
+                  return_bucket_mapping,                                    \
+                  offset_t,                                                 \
+                  index_t,                                                  \
+                  std::nullptr_t>(                                          \
+                  lengths,                                                  \
+                  indices,                                                  \
+                  weights,                                                  \
+                  bucketize_pos,                                            \
+                  block_sizes,                                              \
+                  my_size,                                                  \
+                  new_lengths,                                              \
+                  new_indices,                                              \
+                  new_weights,                                              \
+                  new_pos,                                                  \
+                  unbucketize_permute,                                      \
+                  batch_size_per_feature,                                   \
+                  block_bucketize_pos,                                      \
+                  bucket_mapping);                                          \
+            });                                                             \
+      });
+  const auto lengths_sum = indices.numel();
+  if (weights.has_value()) {
+    Tensor weights_value = weights.value();
+    new_weights = native_empty_like(weights_value);
+    if (sequence) {
+      unbucketize_permute = at::empty({lengths_sum}, indices.options());
+      if (return_bucket_mapping) {
+        bucket_mapping = at::empty({lengths_sum}, indices.options());
+        LAUNCH_BLOCK_BUCKETIZE_SPARSE_FEATURES_WITH_WEIGHT(true, true)
+      } else {
+        LAUNCH_BLOCK_BUCKETIZE_SPARSE_FEATURES_WITH_WEIGHT(true, false)
+      }
+    } else {
+      if (return_bucket_mapping) {
+        bucket_mapping = at::empty({lengths_sum}, indices.options());
+        LAUNCH_BLOCK_BUCKETIZE_SPARSE_FEATURES_WITH_WEIGHT(false, true)
+      } else {
+        LAUNCH_BLOCK_BUCKETIZE_SPARSE_FEATURES_WITH_WEIGHT(false, false)
+      }
+    }
+  } else {
+    if (sequence) {
+      unbucketize_permute = at::empty({lengths_sum}, indices.options());
+      if (return_bucket_mapping) {
+        bucket_mapping = at::empty({lengths_sum}, indices.options());
+        LAUNCH_BLOCK_BUCKETIZE_SPARSE_FEATURES_WITHOUT_WEIGHT(true, true)
+      } else {
+        LAUNCH_BLOCK_BUCKETIZE_SPARSE_FEATURES_WITHOUT_WEIGHT(true, false)
+      }
+    } else {
+      if (return_bucket_mapping) {
+        bucket_mapping = at::empty({lengths_sum}, indices.options());
+        LAUNCH_BLOCK_BUCKETIZE_SPARSE_FEATURES_WITHOUT_WEIGHT(false, true)
+      } else {
+        LAUNCH_BLOCK_BUCKETIZE_SPARSE_FEATURES_WITHOUT_WEIGHT(false, false)
+      }
+    }
+  }
+#undef LAUNCH_BLOCK_BUCKETIZE_SPARSE_FEATURES_WITH_WEIGHT
+#undef LAUNCH_BLOCK_BUCKETIZE_SPARSE_FEATURES_WITHOUT_WEIGHT
+  return {
+      new_lengths,
+      new_indices,
+      new_weights,
+      new_pos,
+      unbucketize_permute,
+      bucket_mapping};
+}
 
 std::tuple<
     Tensor,
@@ -944,158 +1154,64 @@ block_bucketize_sparse_features_cpu(
     const c10::optional<Tensor>& batch_size_per_feature,
     const int64_t /* max_batch_size */, // Only used in GPU variant
     const c10::optional<std::vector<at::Tensor>>& block_bucketize_pos) {
-  const auto lengths_size = lengths.numel();
-  const auto new_lengths_size = lengths_size * my_size;
-  auto new_lengths = at::zeros({new_lengths_size}, lengths.options());
-  auto new_indices = native_empty_like(indices);
-  Tensor new_weights;
-  Tensor new_pos;
-  Tensor unbucketize_permute;
-  if (bucketize_pos) {
-    new_pos = native_empty_like(indices);
-  }
-  if (weights.has_value()) {
-    const auto lengths_sum = indices.numel();
-    Tensor weights_value = weights.value();
-    new_weights = native_empty_like(weights_value);
-    if (sequence) {
-      unbucketize_permute = at::empty({lengths_sum}, indices.options());
-      AT_DISPATCH_INDEX_TYPES(
-          lengths.scalar_type(),
-          "block_bucketize_sparse_features_weights_cpu_1",
-          [&] {
-            using offset_t = index_t;
-            AT_DISPATCH_INDEX_TYPES(
-                indices.scalar_type(),
-                "block_bucketize_sparse_features_weights_cpu_2",
-                [&] {
-                  FBGEMM_DISPATCH_FLOAT_ONLY(
-                      weights_value.scalar_type(),
-                      "bucketize_sparse_features_weights_cpu_3",
-                      [&] {
-                        _block_bucketize_sparse_features_cpu<
-                            true,
-                            true,
-                            offset_t,
-                            index_t,
-                            scalar_t>(
-                            lengths,
-                            indices,
-                            weights,
-                            bucketize_pos,
-                            block_sizes,
-                            my_size,
-                            new_lengths,
-                            new_indices,
-                            new_weights,
-                            new_pos,
-                            unbucketize_permute,
-                            batch_size_per_feature,
-                            block_bucketize_pos);
-                      });
-                });
-          });
-    } else {
-      AT_DISPATCH_INDEX_TYPES(
-          lengths.scalar_type(),
-          "block_bucketize_sparse_features_weights_cpu_1",
-          [&] {
-            using offset_t = index_t;
-            AT_DISPATCH_INDEX_TYPES(
-                indices.scalar_type(),
-                "block_bucketize_sparse_features_weights_cpu_2",
-                [&] {
-                  FBGEMM_DISPATCH_FLOAT_ONLY(
-                      weights_value.scalar_type(),
-                      "bucketize_sparse_features_weights_cpu_3",
-                      [&] {
-                        _block_bucketize_sparse_features_cpu<
-                            false,
-                            true,
-                            offset_t,
-                            index_t,
-                            scalar_t>(
-                            lengths,
-                            indices,
-                            weights,
-                            bucketize_pos,
-                            block_sizes,
-                            my_size,
-                            new_lengths,
-                            new_indices,
-                            new_weights,
-                            new_pos,
-                            unbucketize_permute,
-                            batch_size_per_feature,
-                            block_bucketize_pos);
-                      });
-                });
-          });
-    }
-  } else {
-    if (sequence) {
-      const auto lengths_sum = indices.numel();
-      unbucketize_permute = at::empty({lengths_sum}, indices.options());
-      AT_DISPATCH_INDEX_TYPES(
-          lengths.scalar_type(), "block_bucketize_sparse_features_cpu_1", [&] {
-            using offset_t = index_t;
-            AT_DISPATCH_INDEX_TYPES(
-                indices.scalar_type(),
-                "block_bucketize_sparse_features_cpu_2",
-                [&] {
-                  _block_bucketize_sparse_features_cpu<
-                      true,
-                      false,
-                      offset_t,
-                      index_t,
-                      std::nullptr_t>(
-                      lengths,
-                      indices,
-                      weights,
-                      bucketize_pos,
-                      block_sizes,
-                      my_size,
-                      new_lengths,
-                      new_indices,
-                      new_weights,
-                      new_pos,
-                      unbucketize_permute,
-                      batch_size_per_feature,
-                      block_bucketize_pos);
-                });
-          });
-    } else {
-      AT_DISPATCH_INDEX_TYPES(
-          lengths.scalar_type(), "block_bucketize_sparse_features_cpu_1", [&] {
-            using offset_t = index_t;
-            AT_DISPATCH_INDEX_TYPES(
-                indices.scalar_type(),
-                "block_bucketize_sparse_features_cpu_2",
-                [&] {
-                  _block_bucketize_sparse_features_cpu<
-                      false,
-                      false,
-                      offset_t,
-                      index_t,
-                      std::nullptr_t>(
-                      lengths,
-                      indices,
-                      weights,
-                      bucketize_pos,
-                      block_sizes,
-                      my_size,
-                      new_lengths,
-                      new_indices,
-                      new_weights,
-                      new_pos,
-                      unbucketize_permute,
-                      batch_size_per_feature,
-                      block_bucketize_pos);
-                });
-          });
-    }
-  }
+  Tensor new_lengths;
+  Tensor new_indices;
+  c10::optional<Tensor> new_weights;
+  c10::optional<Tensor> new_pos;
+  c10::optional<Tensor> unbucketize_permute;
+  std::tie(
+      new_lengths,
+      new_indices,
+      new_weights,
+      new_pos,
+      unbucketize_permute,
+      std::ignore) =
+      _block_bucketize_sparse_features_cpu(
+          lengths,
+          indices,
+          bucketize_pos,
+          sequence,
+          block_sizes,
+          my_size,
+          weights,
+          batch_size_per_feature,
+          -1, /* placeholder for max_batch_size */
+          block_bucketize_pos,
+          false);
   return {new_lengths, new_indices, new_weights, new_pos, unbucketize_permute};
+}
+
+std::tuple<
+    Tensor,
+    Tensor,
+    c10::optional<Tensor>,
+    c10::optional<Tensor>,
+    c10::optional<Tensor>,
+    c10::optional<Tensor>>
+block_bucketize_sparse_features_inference_cpu(
+    const Tensor& lengths,
+    const Tensor& indices,
+    const bool bucketize_pos,
+    const bool sequence,
+    const Tensor& block_sizes,
+    const int64_t my_size,
+    const c10::optional<Tensor>& weights,
+    const c10::optional<Tensor>& batch_size_per_feature,
+    const int64_t /* max_batch_size */, // Only used in GPU variant
+    const c10::optional<std::vector<at::Tensor>>& block_bucketize_pos,
+    const bool return_bucket_mapping) {
+  return _block_bucketize_sparse_features_cpu(
+      lengths,
+      indices,
+      bucketize_pos,
+      sequence,
+      block_sizes,
+      my_size,
+      weights,
+      batch_size_per_feature,
+      -1, /* placeholder for max_batch_size */
+      block_bucketize_pos,
+      return_bucket_mapping);
 }
 
 // This function partitions sparse features
@@ -2823,7 +2939,11 @@ TORCH_LIBRARY_FRAGMENT(fbgemm, m) {
       "expand_into_jagged_permute(Tensor permute, Tensor input_offset, Tensor output_offset, SymInt output_size) -> Tensor",
       {PT2_COMPLIANT_TAG});
   m.def(
+      "populate_bucketized_permute(Tensor lengths, Tensor bucketized_lengths, Tensor bucket_mapping) -> Tensor");
+  m.def(
       "block_bucketize_sparse_features(Tensor lengths, Tensor indices, bool bucketize_pos, bool sequence, Tensor block_sizes, SymInt my_size, Tensor? weights=None, Tensor? batch_size_per_feature=None, SymInt max_B= -1, Tensor[]? block_bucketize_pos=None) -> (Tensor, Tensor, Tensor?, Tensor?, Tensor?)");
+  m.def(
+      "block_bucketize_sparse_features_inference(Tensor lengths, Tensor indices, bool bucketize_pos, bool sequence, Tensor block_sizes, SymInt my_size, Tensor? weights=None, Tensor? batch_size_per_feature=None, SymInt max_B= -1, Tensor[]? block_bucketize_pos=None, bool return_bucket_mapping=False) -> (Tensor, Tensor, Tensor?, Tensor?, Tensor?, Tensor?)");
   m.def(
       "bucketize_sparse_features(Tensor lengths, Tensor indices, bool bucketize_pos, SymInt my_size, Tensor? weights=None) -> (Tensor, Tensor, Tensor?, Tensor?)");
   m.def(
@@ -2921,8 +3041,14 @@ TORCH_LIBRARY_IMPL(fbgemm, CPU, m) {
   DISPATCH_TO_CPU(
       "expand_into_jagged_permute", fbgemm_gpu::expand_into_jagged_permute_cpu);
   DISPATCH_TO_CPU(
+      "populate_bucketized_permute",
+      fbgemm_gpu::populate_bucketized_permute_cpu);
+  DISPATCH_TO_CPU(
       "block_bucketize_sparse_features",
       fbgemm_gpu::block_bucketize_sparse_features_cpu);
+  DISPATCH_TO_CPU(
+      "block_bucketize_sparse_features_inference",
+      fbgemm_gpu::block_bucketize_sparse_features_inference_cpu);
   DISPATCH_TO_CPU(
       "bucketize_sparse_features", fbgemm_gpu::bucketize_sparse_features_cpu);
   DISPATCH_TO_CPU(
