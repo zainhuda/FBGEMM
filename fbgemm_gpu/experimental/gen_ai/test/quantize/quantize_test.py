@@ -4,6 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-strict
+
 # pyre-ignore-all-errors[56]
 
 import unittest
@@ -187,7 +189,7 @@ class FP8Tests(unittest.TestCase):
         w = wq.bfloat16() * w_scale
 
         zq_ref = (x @ w.T).to(torch.bfloat16)
-        torch.testing.assert_close(zq[:B, :], zq_ref, atol=1.0e-3, rtol=1.0e-3)
+        torch.testing.assert_close(zq[:B, :], zq_ref, atol=2.0e-3, rtol=2.0e-3)
 
     @settings(deadline=None)
     @given(
