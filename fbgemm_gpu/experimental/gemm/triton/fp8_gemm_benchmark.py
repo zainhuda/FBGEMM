@@ -4,6 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-strict
+
 from typing import Callable, Tuple
 
 import torch
@@ -124,7 +126,7 @@ def scale_block_bench(x: Tensor, w: Tensor) -> Callable[[], Tensor]:
         w_scale: Tensor
         x_fp8, x_scale = quantize_fp8_block(x)
         w_fp8, w_scale = quantize_fp8_block(w)
-        return matmul_fp8_row(
+        return matmul_fp8_block(
             x_fp8,
             w_fp8,
             x_scale,
